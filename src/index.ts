@@ -128,6 +128,97 @@ async function resolveDoName(
   return { doName: raw, linkedUserId: raw, shared: false };
 }
 
+// ───────────────────────── API: Multi-bot Telegram (admin) ─────────────────────────
+
+/**
+ * Register an additional Telegram bot via KV (multi-bot support).
+ * Each bot gets its own webhook URL: /webhook/telegram/:botId
+ * Body: { token: string, userId?: string, requireLink?: boolean }
+ * - token: BotFather token (e.g. "123456:ABC-DEF...")
+ * - userId: if set, ALL chats on this bot route to this user's DO (dedicated bot)
+ * - requireLink: if false, skip the /link requirement (default: false for dedicated bots)
+ */
+app.post("/api/admin/telegram-bots", async (c) => {
+  const body = await c.req.json<{ token: string; userId?: string; requireLink?: boolean }>();
+  if (!body.token || !body.token.includes(":")) {
+    return c.json({ error: "Invalid bot token" }, 400);
+  }
+
+  const botId = body.token.split(":")[0];
+  const secretToken = crypto.randomUUID();
+  const isDedicated = !!body.userId;
+
+  const config = {
+    token: body.token,
+    secretToken,
+    userId: body.userId ?? null,
+    requireLink: body.requireLink ?? !isDedicated,
+  };
+
+  await c.env.LINKS.put(`tg_bot:${botId}`, JSON.stringify(config));
+
+  const workerUrl = new URL(c.req.url).origin;
+  const webhookUrl = `${workerUrl}/webhook/telegram/${botId}`;
+
+  const [webhookResp] = await Promise.all([
+    fetch(`https://api.telegram.org/bot${body.token}/setWebhook`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        url: webhookUrl,
+        secret_token: secretToken,
+        allowed_updates: ["message", "callback_query", "message_reaction"],
+      }),
+    }),
+    fetch(`https://api.telegram.org/bot${body.token}/setMyCommands`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        commands: [
+          { command: "status", description: "Model, tokens, agent info" },
+          { command: "research", description: "Deep research with parallel sub-agents" },
+          { command: "model", description: "Show or switch the active LLM" },
+          { command: "memory", description: "Show persistent memory" },
+          { command: "reset", description: "Reset current session" },
+          { command: "help", description: "Show available commands" },
+        ],
+      }),
+    }),
+  ]);
+
+  const webhookResult = await webhookResp.json<{ ok: boolean; description?: string }>();
+  if (!webhookResult.ok) {
+    return c.json({ error: "Failed to register Telegram webhook", details: webhookResult.description }, 502);
+  }
+
+  return c.json({ ok: true, botId, webhookUrl, dedicated: isDedicated, userId: body.userId ?? null });
+});
+
+app.get("/api/admin/telegram-bots", async (c) => {
+  // List all registered multi-bots (KV prefix scan not available — return info message)
+  return c.json({ info: "Use GET /api/admin/telegram-bots/:botId to check a specific bot" });
+});
+
+app.get("/api/admin/telegram-bots/:botId", async (c) => {
+  const botId = c.req.param("botId");
+  const raw = await c.env.LINKS.get(`tg_bot:${botId}`);
+  if (!raw) return c.json({ error: "Bot not found" }, 404);
+  const config = JSON.parse(raw);
+  // Don't expose the full token
+  return c.json({ botId, dedicated: !!config.userId, userId: config.userId, requireLink: config.requireLink });
+});
+
+app.delete("/api/admin/telegram-bots/:botId", async (c) => {
+  const botId = c.req.param("botId");
+  const raw = await c.env.LINKS.get(`tg_bot:${botId}`);
+  if (raw) {
+    const config = JSON.parse(raw);
+    await deleteTelegramWebhook(config.token);
+  }
+  await c.env.LINKS.delete(`tg_bot:${botId}`);
+  return c.json({ ok: true });
+});
+
 // ───────────────────────── API: Telegram setup (admin) ─────────────────────────
 
 /**
@@ -271,6 +362,93 @@ app.post("/webhook/telegram", async (c) => {
     headers: {
       "Content-Type": "application/json",
       "X-Bot-Token": botToken,
+      "X-Chat-Id": chatId,
+      "X-Platform": "telegram",
+      ...(shared && { "X-Shared-Mode": "true" }),
+      "x-partykit-room": doName,
+    },
+    body: JSON.stringify(update),
+  }));
+});
+
+/**
+ * Multi-bot Telegram webhook. Bot config stored in KV (registered via /api/admin/telegram-bots).
+ * Supports dedicated bots (all traffic → one user's DO) and shared bots (standard link flow).
+ */
+app.post("/webhook/telegram/:botId", async (c) => {
+  const botId = c.req.param("botId");
+  const raw = await c.env.LINKS.get(`tg_bot:${botId}`);
+  if (!raw) return new Response("Not found", { status: 404 });
+
+  const botConfig: { token: string; secretToken: string; userId: string | null; requireLink: boolean } = JSON.parse(raw);
+
+  // Verify webhook secret
+  const secretToken = c.req.header("X-Telegram-Bot-Api-Secret-Token") ?? "";
+  if (!timingSafeEqual(secretToken, botConfig.secretToken)) {
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  const update = await c.req.json<{
+    message?: { chat: { id: number }; text?: string };
+    callback_query?: { message?: { chat: { id: number } } };
+    message_reaction?: { chat: { id: number }; message_id: number };
+  }>();
+  const chatId = String(
+    update.message?.chat?.id ?? update.callback_query?.message?.chat?.id ?? update.message_reaction?.chat?.id ?? ""
+  );
+  if (!chatId) return c.json({ ok: true });
+
+  const text = update.message?.text ?? "";
+  const isReaction = !!update.message_reaction;
+  const isAllowedCommand = /^\/(start|link|help)\b/.test(text) || isReaction;
+
+  // Dedicated bot: route ALL traffic to the configured userId's DO
+  let doName: string;
+  let linkedUserId: string | null;
+  let shared = false;
+
+  if (botConfig.userId) {
+    doName = botConfig.userId;
+    linkedUserId = botConfig.userId;
+  } else {
+    const resolved = await resolveDoName(c.env.LINKS, "tg", chatId);
+    doName = resolved.doName;
+    linkedUserId = resolved.linkedUserId;
+    shared = resolved.shared;
+
+    // Require link if configured
+    if (botConfig.requireLink && !linkedUserId && !isAllowedCommand) {
+      await sendTelegramMessage(botConfig.token, Number(chatId),
+        "Link your Telegram to your clopinette\\.app account first\\.\nUse /link to get started\\.");
+      return new Response("ok");
+    }
+  }
+
+  // Quota gate
+  if (linkedUserId && !isAllowedCommand) {
+    const quota = await checkQuotaFromKV(
+      c.env.LINKS, linkedUserId, c.env.GATEWAY_URL,
+      c.env.GATEWAY_INTERNAL_KEY ?? c.env.WS_SIGNING_SECRET
+    );
+    if (!quota.allowed) {
+      const msg = quota.reason === "payment_failed"
+        ? "Your payment failed\\. Please update your billing at clopinette\\.app/billing"
+        : quota.reason === "monthly_limit" || quota.reason === "daily_limit"
+          ? "Monthly usage limit reached\\. Check usage at clopinette\\.app/dashboard"
+          : "Telegram is available on Pro and BYOK plans\\. Upgrade at clopinette\\.app/pricing";
+      await sendTelegramMessage(botConfig.token, Number(chatId), msg);
+      return new Response("ok");
+    }
+  }
+
+  const id = c.env.CLOPINETTE_AGENT.idFromName(doName);
+  const stub = c.env.CLOPINETTE_AGENT.get(id);
+
+  return stub.fetch(new Request(c.req.raw.url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Bot-Token": botConfig.token,
       "X-Chat-Id": chatId,
       "X-Platform": "telegram",
       ...(shared && { "X-Shared-Mode": "true" }),
